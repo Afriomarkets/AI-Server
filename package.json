@@ -1,0 +1,26 @@
+{
+  "name": "ai-server",
+  "version": "1.0.0",
+  "main": "ai-server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node ai-server.js -p 5173",
+    "dev": "nodemon ai-server.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@ai-sdk/deepseek": "^1.0.17",
+    "@medusajs/js-sdk": "^2.10.2",
+    "@medusajs/medusa-js": "^6.1.7",
+    "@supabase/supabase-js": "^2.57.4",
+    "ai": "^5.0.44",
+    "dotenv": "^17.2.1",
+    "ollama": "^0.5.17",
+    "pino": "^9.9.5",
+    "ws": "^8.18.3",
+    "zod": "^3.25.76",
+    "zod-to-json-schema": "^3.24.6"
+  }
+}
