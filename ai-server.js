@@ -67,7 +67,7 @@ const systemPrompts = {
   Act professionally and empathetically, but also be proactive in suggesting solutions. 
   Be concise and clear in your responses. If you cannot help, suggest escalating to a human agent. 
   Use the tools available to you to get customer info, check product details, and create support tickets when needed. 
-  Format JSON data in a user-friendly way when presenting to users.`,
+  Format JSON data in a user-friendly way when presenting to users. Avoid giving away sensitive or unsolicited info to customer when responding to a customer directly, be straightforward and brief but also helpful. You can provide more detailed responses to the support staff agent, when they ask.`,
   bargaining: `You are a sales assistant. Help customers negotiate prices considering:
   - Minimum order quantities
   - Vendor minimum prices
@@ -357,18 +357,18 @@ class HaggleManager {
       // Determine if the offer is acceptable
       const accepted = counterOfferRounded >= minAcceptablePrice;
 
-      // console.log("Bargaining request:", {
-      //   productId,
-      //   variantId,
-      //   counterOfferRounded,
-      //   minPrice,
-      //   minAcceptablePrice,
-      //   accepted,
-      //   customerId,
-      //   cart_id,
-      //   region_id,
-      //   currency_code,
-      // });
+      console.log("Bargaining request:", {
+        productId,
+        variantId,
+        counterOfferRounded,
+        minPrice,
+        minAcceptablePrice,
+        accepted,
+        customerId,
+        cart_id,
+        region_id,
+        currency_code,
+      });
 
       let responsePayload = {};
 
@@ -451,7 +451,8 @@ class HaggleManager {
     sessionId,
     customerId,
     region_id,
-    currency_code, price
+    currency_code,
+    price
   ) {
     const discountAmount = price - counterOffer;
     const expiresAt = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(); // 4 hours
@@ -552,10 +553,339 @@ class HaggleManager {
   }
 }
 
+class CustomerSupportSessionManager {
+  constructor() {
+    this.activeSessions = new Map();
+    this.agentPresence = new Map(); // sessionId -> Set of agent IDs
+    this.helpdeskChannels = new Map(); // sessionId -> helpdesk channel
+  }
+
+  // System prompts
+  getSystemPrompt(mode = "support") {
+    const prompts = systemPrompts;
+    return prompts[mode] || prompts.support;
+  }
+
+  // Tools for AI
+  getTools() {
+    return {
+      ...tools,
+      escalateToHuman: tool({
+        description: "Escalate conversation to human agent",
+        parameters: {
+          sessionId: { type: "string" },
+          reason: { type: "string" },
+        },
+        execute: async ({ sessionId, reason }) => {
+          try {
+            // Notify all agents about escalation
+            const helpdeskChannel = supabase.channel(`helpdesk:${sessionId}`);
+            await helpdeskChannel.send({
+              type: "broadcast",
+              event: "escalation_request",
+              payload: {
+                sessionId,
+                reason,
+                timestamp: new Date().toISOString(),
+              },
+            });
+            return {
+              success: true,
+              message: "Escalation request sent to agents",
+            };
+          } catch (error) {
+            console.error("Error escalating to human:", error);
+            return { success: false, error: error.message };
+          }
+        },
+      }),
+    };
+  }
+
+  // AI Response Generator
+  async generateAIResponse(prompt, context = [], sessionId = null) {
+    if (!prompt) {
+      return "I'm sorry, I didn't understand that. Could you please rephrase?";
+    }
+    const aiResponse = await aiGenerator.generateResponse(
+      prompt,
+      context,
+      sessionId,
+      "support",
+      "Customer"
+    );
+
+    // return safeJSONParse(aiResponse);
+    return aiResponse;
+  }
+
+  // Check if agents are active for a session
+  isAgentActive(sessionId) {
+    return (
+      this.agentPresence.has(sessionId) &&
+      this.agentPresence.get(sessionId).size > 0
+    );
+  }
+
+  // Initialize or update session
+  async initializeSession(sessionId, customerData = null) {
+    if (!this.activeSessions.has(sessionId)) {
+      let customerInfo = customerData;
+
+      // Try to load customer info if not provided
+      if (customerInfo) {
+        try {
+          if (customerInfo.id) {
+            const { customer } = await medusa.admin.customers.retrieve(
+              customerInfo.id
+            );
+            customerInfo = customer;
+          } else {
+            const { data: sessionData } = await supabase
+              .from("support_session")
+              .select("user_id")
+              .eq("id", sessionId)
+              .single();
+
+            if (sessionData?.user_id) {
+              const { customer } = await medusa.admin.customers.retrieve(
+                sessionData.user_id
+              );
+              customerInfo = customer;
+            }
+          }
+        } catch (error) {
+          console.error("Error loading customer info:", error);
+        }
+      }
+
+      this.activeSessions.set(sessionId, {
+        customer: customerInfo,
+        lastActivity: Date.now(),
+        mode: "support",
+        messageHistory: [],
+      });
+      this.setupHelpdeskChannel(sessionId);
+      console.log(`Initialized session: ${sessionId}`);
+    }
+
+    // Update activity timestamp
+    const session = this.activeSessions.get(sessionId);
+    session.lastActivity = Date.now();
+    this.activeSessions.set(sessionId, session);
+
+    return this.activeSessions.get(sessionId);
+  }
+
+  // Setup all channels
+  setupChannels() {
+    this.setupPresenceWatcher();
+    this.setupCleanupInterval();
+  }
+
+  setupPresenceWatcher() {
+    const presenceChannel = supabase.channel("presence:watcher", {
+      config: { presence: { key: "ai-support" } },
+    });
+
+    presenceChannel
+      .on("presence", { event: "sync" }, () => {
+        const state = presenceChannel.presenceState();
+        // console.log("Presence watcher state:", Object.keys(state), state);
+
+        // Initialize sessions for all present users
+        Object.values(state).forEach((users) => {
+          users.forEach((user) => {
+            if (user.sessionId && !this.activeSessions.has(user.sessionId)) {
+              this.initializeSession(user.sessionId, user.customer);
+            }
+          });
+        });
+      })
+      .on("presence", { event: "join" }, ({ key, newPresences }) => {
+        newPresences.forEach(async (presence) => {
+          if (presence.sessionId) {
+            console.log("Hello, New Presence");
+            await this.initializeSession(presence.sessionId, presence.customer);
+            console.log(
+              `User joined: ${presence.sessionId} (${
+                presence.role || "customer"
+              })`
+            );
+          }
+        });
+      })
+      .on("presence", { event: "leave" }, ({ key, leftPresences }) => {
+        leftPresences.forEach((presence) => {
+          if (presence.sessionId) {
+            console.log(`User left: ${presence.sessionId}`);
+          }
+        });
+      })
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          console.log("Presence watcher subscribed successfully");
+        }
+      });
+  }
+
+  setupHelpdeskChannel(sessionId) {
+    if (this.helpdeskChannels.has(sessionId)) {
+      return; // Already set up
+    }
+    const session = this.activeSessions.get(sessionId);
+    const helpdeskChannel = supabase.channel(`helpdesk:${sessionId}`, {
+      config: {
+        // broadcast: { self: true },
+        presence: { key: "ai-agent" },
+      },
+    });
+
+    helpdeskChannel
+      .on("presence", { event: "sync" }, async () => {
+        const state = helpdeskChannel.presenceState();
+        const agents = new Set();
+
+        // Track agent presence
+        Object.values(state).forEach((participants) => {
+          participants.forEach((participant) => {
+            console.log(participant);
+            if (participant.role === "agent") {
+              agents.add(participant.agent.id);
+            }
+          });
+        });
+
+        this.agentPresence.set(sessionId, agents);
+        console.log(`Agents in helpdesk:${sessionId}:`, Array.from(agents));
+      })
+      .on("broadcast", { event: "message" }, async ({ payload }) => {
+        // console.log(payload);
+        const { text: message, sender, timestamp } = payload;
+
+        if (sender === "agent") {
+          // Store agent messages in history but don't AI respond
+          if (session) {
+            session.messageHistory.push({
+              sender: "agent",
+              message: payload.message,
+            });
+            session.lastActivity = Date.now();
+          }
+        } else if (sender === "user") {
+          // If no agents are active, AI should respond
+          if (!this.isAgentActive(sessionId)) {
+            const context = session.messageHistory.slice(-5); // Last 5 messages as context
+            const response = await this.generateAIResponse(
+              message,
+              context,
+              sessionId
+            );
+
+            // console.log(response);
+
+            // Store message in history
+            session.messageHistory.push({ sender: "customer", message });
+            session.messageHistory.push({ sender: "bot", message: response });
+            session.lastActivity = Date.now();
+
+            await this.sendToHelpdesk(sessionId, {
+              type: "message",
+              message: response,
+              text: response,
+              sender: "ai-agent",
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+      })
+      .on("presence", { event: "join" }, ({ key, newPresences }) => {
+        newPresences.forEach(async (participant) => {
+          if (participant.role === "agent") {
+            if (!this.agentPresence.has(sessionId)) {
+              this.agentPresence.set(sessionId, new Set());
+            }
+            this.agentPresence.get(sessionId).add(participant.agentId);
+            console.log(
+              `Agent ${participant.agentId} joined helpdesk:${sessionId}`
+            );
+          } else if (participant.role === "customer") {
+            await this.initializeSession(sessionId);
+          }
+          // else{
+          //   await this.initializeSession(sessionId);
+          // }
+        });
+      })
+      .on("presence", { event: "leave" }, ({ key, leftPresences }) => {
+        leftPresences.forEach((participant) => {
+          if (
+            participant.role === "agent" &&
+            this.agentPresence.has(sessionId)
+          ) {
+            this.agentPresence.get(sessionId).delete(participant.agentId);
+            console.log(
+              `Agent ${participant.agentId} left helpdesk:${sessionId}`
+            );
+          }
+        });
+      })
+
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          console.log(`Helpdesk channel subscribed: helpdesk:${sessionId}`);
+          this.helpdeskChannels.set(sessionId, helpdeskChannel);
+        }
+      });
+  }
+
+  // Channel communication methods
+  async sendToHelpdesk(sessionId, payload) {
+    if (this.helpdeskChannels.has(sessionId)) {
+      await this.helpdeskChannels.get(sessionId).send({
+        type: "broadcast",
+        event: "message",
+        payload: payload,
+      });
+    }
+  }
+
+  async sendToSession(sessionId, payload) {
+    const channel = supabase.channel(`session:${sessionId}`);
+    await channel.send({
+      type: "broadcast",
+      event: "ai_message",
+      payload: payload,
+    });
+  }
+
+  setupCleanupInterval() {
+    setInterval(() => {
+      const now = Date.now();
+      for (const [sessionId, session] of this.activeSessions.entries()) {
+        // Cleanup after 30 minutes of inactivity
+        if (now - session.lastActivity > 30 * 60 * 1000) {
+          // Clean up channels
+          if (this.helpdeskChannels.has(sessionId)) {
+            supabase.removeChannel(this.helpdeskChannels.get(sessionId));
+            this.helpdeskChannels.delete(sessionId);
+          }
+
+          this.activeSessions.delete(sessionId);
+          this.agentPresence.delete(sessionId);
+          console.log(`Cleaned up inactive session: ${sessionId}`);
+        }
+      }
+    }, 5 * 60 * 1000); // Check every 5 minutes
+  }
+}
+
 // Initialize the haggle manager
 const haggleManager = new HaggleManager();
 
 const sessionManager = new SessionManager();
+
+const custSessionManager = new CustomerSupportSessionManager();
 
 // Error handling utilities
 class AppError extends Error {
@@ -635,7 +965,7 @@ const schemas = {
 };
 
 function formatPrice({ amount, currencyCode, regionId }) {
-  let localeCurrency = currencyCode
+  let localeCurrency = currencyCode;
 
   // if (regionId) {
   //   const { region } = await medusa.regions.retrieve(regionId)
@@ -643,18 +973,17 @@ function formatPrice({ amount, currencyCode, regionId }) {
   // }
 
   if (!localeCurrency) {
-    throw new Error("Either currencyCode or regionId must be provided")
+    throw new Error("Either currencyCode or regionId must be provided");
   }
 
   const formatter = new Intl.NumberFormat(undefined, {
     style: "currency",
     currency: localeCurrency.toUpperCase(),
-    currencyDisplay: 'narrowSymbol'
-  })
+    currencyDisplay: "narrowSymbol",
+  });
 
-  return formatter.format(amount / 100) // convert from minor units
+  return formatter.format(amount / 100); // convert from minor units
 }
-
 
 // Tool definitions with comprehensive error handling and validation
 const tools = {
@@ -733,23 +1062,51 @@ const tools = {
 
         if (customerOffer >= minPrice) {
           // Customer offer meets or exceeds our price
-          counterOffer = minPrice;
-          message = `We accept your offer of ${formatPrice({amount: customerOffer, currencyCode: currency_code, regionId: region_id})}. The product is yours!`;
+          counterOffer = customerOffer;
+          message = `We accept your offer of ${formatPrice({
+            amount: customerOffer,
+            currencyCode: currency_code,
+            regionId: region_id,
+          })}. The product is yours!`;
         } else if (customerOffer >= targetPrice) {
           // Customer offer is reasonable but below our price
           counterOffer = Math.min(
             customerOffer + Math.ceil((minPrice - customerOffer) * 0.3),
             minPrice
           );
-          message = `We appreciate your offer. Our best counter offer is ${ formatPrice({amount: counterOffer, currencyCode: currency_code, regionId: region_id})}.`;
+          message = `We appreciate your offer. Our best counter offer is ${formatPrice(
+            {
+              amount: counterOffer,
+              currencyCode: currency_code,
+              regionId: region_id,
+            }
+          )}.`;
         } else if (customerOffer >= minAcceptablePrice) {
           // Customer offer is low but acceptable
           counterOffer = targetPrice;
-          message = `We can offer you a special price of ${formatPrice({amount: counterOffer, currencyCode: currency_code, regionId: region_id})} (regular price: ${formatPrice({amount: minPrice, currencyCode: currency_code, regionId: region_id})}).`;
+          message = `We can offer you a special price of ${formatPrice({
+            amount: counterOffer,
+            currencyCode: currency_code,
+            regionId: region_id,
+          })} (regular price: ${formatPrice({
+            amount: minPrice,
+            currencyCode: currency_code,
+            regionId: region_id,
+          })}).`;
         } else {
           // Customer offer is too low
           counterOffer = minAcceptablePrice;
-          message = `Unfortunately, we cannot accept offers below ${formatPrice({amount: minAcceptablePrice, currencyCode: currency_code, regionId: region_id})}. Our best price is ${formatPrice({amount: minPrice, currencyCode: currency_code, regionId: region_id})}.`;
+          message = `Unfortunately, we cannot accept offers below ${formatPrice(
+            {
+              amount: minAcceptablePrice,
+              currencyCode: currency_code,
+              regionId: region_id,
+            }
+          )}. Our best price is ${formatPrice({
+            amount: minPrice,
+            currencyCode: currency_code,
+            regionId: region_id,
+          })}.`;
         }
 
         // Check inventory
@@ -1656,8 +2013,6 @@ const tools = {
     },
   }),
 
-  
-
   applyDiscountToCart: tool({
     description: "Apply a discount code to a customer's cart",
     inputSchema: z.object({
@@ -1739,7 +2094,8 @@ class AIResponseGenerator {
     prompt,
     context = [],
     sessionId = null,
-    mode = "support"
+    mode = "support",
+    from = "Support Agent (Staff)"
   ) {
     if (!prompt || typeof prompt !== "string") {
       throw new AppError("Invalid prompt provided", "INVALID_PROMPT");
@@ -1752,7 +2108,13 @@ class AIResponseGenerator {
 
     try {
       const contextText = Array.isArray(context) ? context.join("\n") : context;
-      const session = sessionId ? sessionManager.getSession(sessionId) : null;
+
+      const session =
+        from !== "Customer"
+          ? sessionId
+            ? sessionManager.getSession(sessionId)
+            : null
+          : custSessionManager.activeSessions.get(sessionId);
       const systemPrompt = systemPrompts[mode];
 
       // Add customer context if available
@@ -1763,9 +2125,9 @@ class AIResponseGenerator {
         )}`;
       }
 
-      console.log("Customer Context:", customerContext);
 
-      const fullPrompt = `${customerContext}\n\nContext: ${contextText}\n\nUser: ${prompt}`;
+      from = mode == "bargaining" ? "Customer" : from;
+      const fullPrompt = `${customerContext}\n\nContext: ${contextText}\n\n${from}: ${prompt}`;
       const provider =
         config.ai.provider === "deepseek" ? "deepseek" : "ollama";
 
@@ -2059,11 +2421,13 @@ async function initialize() {
     const aiChannel = setupChannels();
     const healthChannel = setupHealthCheck();
 
+    //Customer Support Sess Manager
+    custSessionManager.setupChannels();
+
     // Initialize haggle manager
     haggleManager.initializeHagglePresence();
 
     logger.info("AI service started successfully");
-
 
     // Setup session cleanup interval for haggle sessions too
     setInterval(() => {
