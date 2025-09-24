@@ -793,7 +793,7 @@ class CustomerSupportSessionManager {
               type: "message",
               message: response,
               text: response,
-              sender: "ai-agent",
+              sender: "ai_agent",
               timestamp: new Date().toISOString(),
             });
           }
@@ -846,6 +846,7 @@ class CustomerSupportSessionManager {
         type: "broadcast",
         event: "message",
         payload: payload,
+
       });
     }
   }
